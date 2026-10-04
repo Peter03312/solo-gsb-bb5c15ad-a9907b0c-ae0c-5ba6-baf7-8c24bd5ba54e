@@ -16,6 +16,15 @@ def rel(i, a, b):
     return {"id": i, "predecessor_id": a, "successor_id": b}
 
 
+def rel_gap(i, a, b, min_g=None, max_g=None):
+    r = {"id": i, "predecessor_id": a, "successor_id": b}
+    if min_g is not None:
+        r["min_gap_minutes"] = min_g
+    if max_g is not None:
+        r["max_gap_minutes"] = max_g
+    return r
+
+
 def test_basic_propagation():
     events = [
         ev(1, "告警", "2026-10-01T10:00", "2026-10-01T10:30", 15),
@@ -94,6 +103,120 @@ def test_draft_event_skips_relation():
 def test_empty():
     res = compute.compute([], [])
     assert res["status"] == "ok" and res["windows"] == {}
+
+
+def test_min_gap_pushes_earliest():
+    # 最短等待 45 分钟：B 最早开始 = A 最早开始 + A 持续 + 45
+    events = [
+        ev(1, "A", "2026-10-01T10:00", "2026-10-01T10:30", 15),
+        ev(2, "B", "2026-10-01T10:00", "2026-10-01T12:00", 30),
+    ]
+    res = compute.compute(events, [rel_gap(1, 1, 2, min_g=45)])
+    assert res["status"] == "ok", res
+    assert res["windows"][2]["earliest_start"] == "2026-10-01T11:00"
+    # A 最晚开始 = B 最晚开始 12:00 - 15 - 45 = 11:00，但输入 10:30 更紧
+    assert res["windows"][1]["latest_start"] == "2026-10-01T10:30"
+    text = res["windows"][2]["earliest_chain"][-1]["text"]
+    assert "最短等待 45 分钟" in text
+
+
+def test_max_gap_bounds_successor_latest():
+    # 最长等待 20 分钟：B 最晚开始 = A 最晚开始 + A 持续 + 20
+    events = [
+        ev(1, "A", "2026-10-01T10:00", "2026-10-01T10:30", 15),
+        ev(2, "B", "2026-10-01T10:00", "2026-10-01T23:00", 30),
+    ]
+    res = compute.compute(events, [rel_gap(1, 1, 2, max_g=20)])
+    assert res["status"] == "ok", res
+    assert res["windows"][2]["latest_start"] == "2026-10-01T11:05"
+    text = res["windows"][2]["latest_chain"][-1]["text"]
+    assert "最长等待 20 分钟" in text
+
+
+def test_max_gap_pushes_predecessor_earliest():
+    # 最长等待反向约束前项：A 最早开始 = B 最早开始 - A 持续 - 最长等待
+    events = [
+        ev(1, "A", "2026-10-01T10:00", "2026-10-01T23:00", 15),
+        ev(2, "B", "2026-10-01T12:00", "2026-10-01T13:00", 30),
+    ]
+    res = compute.compute(events, [rel_gap(1, 1, 2, max_g=20)])
+    assert res["status"] == "ok", res
+    assert res["windows"][1]["earliest_start"] == "2026-10-01T11:25"
+    text = res["windows"][1]["earliest_chain"][-1]["text"]
+    assert "最长等待 20 分钟" in text
+
+
+def test_min_max_together():
+    events = [
+        ev(1, "A", "2026-10-01T10:00", "2026-10-01T10:30", 15),
+        ev(2, "B", "2026-10-01T10:00", "2026-10-01T12:00", 30),
+    ]
+    res = compute.compute(events, [rel_gap(1, 1, 2, min_g=10, max_g=60)])
+    assert res["status"] == "ok", res
+    w2 = res["windows"][2]
+    assert w2["earliest_start"] == "2026-10-01T10:25"   # 10:00 + 15 + 10
+    assert w2["latest_start"] == "2026-10-01T11:45"     # 10:30 + 15 + 60
+    w1 = res["windows"][1]
+    assert w1["latest_start"] == "2026-10-01T10:30"     # 12:00 - 15 - 10 = 11:35，输入更紧
+    assert w1["earliest_start"] == "2026-10-01T10:00"   # 10:00 - 15 - 60 更早，输入更紧
+
+
+def test_max_gap_conflict_opposing_chains():
+    # B 输入最早 12:00，但 A 最晚 10:00 结束 10:30 + 最长等待 10 ⇒ B 最晚 10:40，冲突
+    events = [
+        ev(1, "A", "2026-10-01T10:00", "2026-10-01T10:00", 30),
+        ev(2, "B", "2026-10-01T12:00", "2026-10-01T13:00", 30),
+    ]
+    res = compute.compute(events, [rel_gap(1, 1, 2, max_g=10)])
+    assert res["status"] == "conflict"
+    win = {c["event_ids"][0]: c for c in res["conflicts"] if c["type"] == "window"}
+    assert set(win) == {1, 2}
+    # 冲突事件给出相反依据链（最早/最晚两条），且链中出现最长等待推导
+    assert win[1]["earliest_chain"] and win[1]["latest_chain"]
+    assert win[2]["earliest_chain"] and win[2]["latest_chain"]
+    all_text = " ".join(
+        s["text"] for c in win.values() for ch in (c["earliest_chain"], c["latest_chain"])
+        for s in ch)
+    assert "最长等待 10 分钟" in all_text
+
+
+def test_cycle_with_gaps_has_opposing_chains():
+    events = [
+        ev(1, "A", "2026-10-01T10:00", "2026-10-01T12:00", 30),
+        ev(2, "B", "2026-10-01T10:00", "2026-10-01T12:00", 30),
+    ]
+    res = compute.compute(events, [rel_gap(1, 1, 2, min_g=5), rel_gap(2, 2, 1, max_g=90)])
+    assert res["status"] == "conflict"
+    cyc = [c for c in res["conflicts"] if c["type"] == "cycle"]
+    assert cyc, res["conflicts"]
+    assert set(cyc[0]["event_ids"]) == {1, 2}
+    assert cyc[0]["earliest_chain"] and cyc[0]["latest_chain"]
+
+
+def test_old_relation_without_gaps_unchanged():
+    # 未设置间隔的旧关系：推算与依据链文案保持旧行为
+    events = [
+        ev(1, "告警", "2026-10-01T10:00", "2026-10-01T10:30", 15),
+        ev(2, "响应", "2026-10-01T10:00", "2026-10-01T12:00", 30),
+    ]
+    res = compute.compute(events, [rel(1, 1, 2)])
+    assert res["status"] == "ok"
+    assert res["windows"][2]["earliest_start"] == "2026-10-01T10:15"
+    text = res["windows"][2]["earliest_chain"][-1]["text"]
+    assert "持续 15 分钟" in text and "等待" not in text
+
+
+def test_skipped_relation_keeps_gap_info():
+    events = [
+        ev(1, "完整", "2026-10-01T10:00", "2026-10-01T11:00", 10),
+        ev(2, "缺范围", None, None, 10),
+    ]
+    res = compute.compute(events, [rel_gap(1, 1, 2, min_g=5, max_g=30)])
+    assert res["status"] == "ok"
+    assert len(res["skipped_relations"]) == 1
+    s = res["skipped_relations"][0]
+    assert s["min_gap_minutes"] == 5 and s["max_gap_minutes"] == 30
+    assert "暂存" in s["reason"]
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

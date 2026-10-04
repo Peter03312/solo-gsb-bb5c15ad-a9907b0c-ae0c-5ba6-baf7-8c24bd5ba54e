@@ -7,7 +7,7 @@ const state = {
   reviews: [],
   current: null,      // 服务器返回的复盘快照 {review, events, relations, computation}
   editEvents: [],     // 编辑中的事件 [{key, id?, name, earliest_start, latest_start, duration_minutes, note}]
-  editRelations: [],  // 编辑中的关系 [{predecessor_key, successor_key}]
+  editRelations: [],  // 编辑中的关系 [{predecessor_key, successor_key, min_gap_minutes, max_gap_minutes}]
   seq: 0,
 };
 
@@ -79,6 +79,8 @@ function resetEdits() {
   state.editRelations = b.relations.map((r) => ({
     predecessor_key: idToKey[r.predecessor_id],
     successor_key: idToKey[r.successor_id],
+    min_gap_minutes: r.min_gap_minutes === null || r.min_gap_minutes === undefined ? 0 : r.min_gap_minutes,
+    max_gap_minutes: r.max_gap_minutes === null || r.max_gap_minutes === undefined ? "" : r.max_gap_minutes,
   })).filter((r) => r.predecessor_key && r.successor_key);
 }
 
@@ -146,6 +148,25 @@ function renderEventsTable() {
   }
 }
 
+/* 间隔展示文案：未设置（最短 0 / 最长不限）时不附加说明，与旧语义一致 */
+function gapText(r) {
+  const min = r.min_gap_minutes === null || r.min_gap_minutes === undefined ? 0 : Number(r.min_gap_minutes);
+  const max = r.max_gap_minutes === null || r.max_gap_minutes === undefined || r.max_gap_minutes === ""
+    ? null : Number(r.max_gap_minutes);
+  const parts = [];
+  if (min > 0) parts.push(`最短等待 ${min} 分钟`);
+  if (max !== null) parts.push(`最长等待 ${max} 分钟`);
+  return parts.length ? `（${parts.join("，")}）` : "";
+}
+
+/* 解析间隔输入：空串 → 默认值；非法 → {ok:false} */
+function parseGapInput(raw, label, emptyValue) {
+  const s = String(raw).trim();
+  if (s === "") return { ok: true, value: emptyValue };
+  if (!/^\d+$/.test(s)) return { ok: false, message: `“先于”关系的${label}必须是非负整数分钟` };
+  return { ok: true, value: parseInt(s, 10) };
+}
+
 function renderRelations() {
   const opts = state.editEvents
     .map((e) => `<option value="${e.key}">${escapeHtml(e.name)}</option>`).join("");
@@ -155,7 +176,25 @@ function renderRelations() {
   ul.innerHTML = "";
   state.editRelations.forEach((r, idx) => {
     const li = document.createElement("li");
-    li.innerHTML = `<span>「${escapeHtml(eventName(r.predecessor_key))}」先于「${escapeHtml(eventName(r.successor_key))}」</span>`;
+    const label = document.createElement("span");
+    label.textContent = `「${eventName(r.predecessor_key)}」先于「${eventName(r.successor_key)}」`;
+    li.appendChild(label);
+
+    const gaps = document.createElement("span");
+    gaps.className = "rel-gaps";
+    gaps.innerHTML =
+      `<label>最短等待 <input type="number" min="0" step="1" data-gap="min" value="${r.min_gap_minutes}"> 分钟</label>` +
+      `<label>最长等待 <input type="number" min="0" step="1" data-gap="max" placeholder="不限" value="${r.max_gap_minutes}"> 分钟</label>`;
+    gaps.querySelector('[data-gap="min"]').addEventListener("input", (ev) => {
+      r.min_gap_minutes = ev.target.value === "" ? "" : parseInt(ev.target.value, 10);
+      if (Number.isNaN(r.min_gap_minutes)) r.min_gap_minutes = "";
+    });
+    gaps.querySelector('[data-gap="max"]').addEventListener("input", (ev) => {
+      r.max_gap_minutes = ev.target.value === "" ? "" : parseInt(ev.target.value, 10);
+      if (Number.isNaN(r.max_gap_minutes)) r.max_gap_minutes = "";
+    });
+    li.appendChild(gaps);
+
     const btn = document.createElement("button");
     btn.textContent = "✕";
     btn.addEventListener("click", () => {
@@ -273,6 +312,26 @@ function syncFromDOM() {
 async function save() {
   if (!state.current) return;
   syncFromDOM();
+  const relations = [];
+  for (const r of state.editRelations) {
+    const min = parseGapInput(r.min_gap_minutes, "最短等待", 0);
+    const max = parseGapInput(r.max_gap_minutes, "最长等待", null);
+    if (!min.ok || !max.ok) {
+      showBanner("⚠ " + escapeHtml(min.message || max.message));
+      return;
+    }
+    if (max.value !== null && max.value < min.value) {
+      showBanner(`⚠ 关系「${escapeHtml(eventName(r.predecessor_key))}」先于` +
+        `「${escapeHtml(eventName(r.successor_key))}」的最长等待不得短于最短等待`);
+      return;
+    }
+    relations.push({
+      predecessor_key: r.predecessor_key,
+      successor_key: r.successor_key,
+      min_gap_minutes: min.value,
+      max_gap_minutes: max.value,
+    });
+  }
   const payload = {
     base_version: state.current.review.version,
     title: $("#review-title").value.trim(),
@@ -284,7 +343,7 @@ async function save() {
       duration_minutes: e.duration_minutes === "" ? null : e.duration_minutes,
       note: e.note,
     })),
-    relations: state.editRelations,
+    relations,
   };
   try {
     const bundle = await api("PUT", "/api/reviews/" + state.current.review.id, payload);
@@ -421,7 +480,7 @@ function renderVersionDetail(detail) {
     const a = byKey[r.predecessor_key], b = byKey[r.successor_key];
     const an = a ? a.name : "?";
     const bn = b ? b.name : "?";
-    return `<div>「${escapeHtml(an)}」先于「${escapeHtml(bn)}」</div>`;
+    return `<div>「${escapeHtml(an)}」先于「${escapeHtml(bn)}」${escapeHtml(gapText(r))}</div>`;
   }).join("") || `<div class="hint">无</div>`;
 
   // 快照事件以 id_<旧行id> 为 key，推算结果窗口仍以旧行 id 为键
@@ -509,7 +568,21 @@ $("#btn-add-event").addEventListener("click", () => {
 $("#btn-add-relation").addEventListener("click", () => {
   const a = $("#rel-pre").value, b = $("#rel-suc").value;
   if (!a || !b) return;
-  state.editRelations.push({ predecessor_key: a, successor_key: b });
+  const min = parseGapInput($("#rel-min-gap").value, "最短等待", 0);
+  const max = parseGapInput($("#rel-max-gap").value, "最长等待", null);
+  if (!min.ok || !max.ok) {
+    showBanner("⚠ " + escapeHtml(min.message || max.message));
+    return;
+  }
+  if (max.value !== null && max.value < min.value) {
+    showBanner("⚠ “先于”关系的最长等待不得短于最短等待");
+    return;
+  }
+  hideBanner();
+  state.editRelations.push({
+    predecessor_key: a, successor_key: b,
+    min_gap_minutes: min.value, max_gap_minutes: max.value === null ? "" : max.value,
+  });
   renderRelations();
 });
 

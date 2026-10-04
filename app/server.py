@@ -87,6 +87,35 @@ def validate_event(e):
     }
 
 
+def _norm_gap(value, label, rel_desc):
+    """规范化“先于”关系的间隔分钟数。
+
+    返回 None 表示未设置；否则为非负整数。非法输入（负数、非整数、
+    超出合理范围）抛 ApiError(400)，在写库前拒绝，记录保持不变。
+    """
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise ApiError(400, "关系{}的{}必须是非负整数分钟".format(rel_desc, label))
+    if isinstance(value, int):
+        iv = value
+    elif isinstance(value, float) and value.is_integer():
+        iv = int(value)
+    elif isinstance(value, str):
+        try:
+            iv = int(value.strip())
+        except ValueError:
+            raise ApiError(400, "关系{}的{}必须是非负整数分钟".format(rel_desc, label))
+    else:
+        raise ApiError(400, "关系{}的{}必须是非负整数分钟".format(rel_desc, label))
+    if iv < 0:
+        raise ApiError(400, "关系{}的{}必须是非负整数分钟".format(rel_desc, label))
+    if iv > 24 * 60 * 30:
+        raise ApiError(400, "关系{}的{}超出合理范围（0～{} 分钟）".format(
+            rel_desc, label, 24 * 60 * 30))
+    return iv
+
+
 def validate_payload(body):
     if not isinstance(body, dict):
         raise ApiError(400, "请求体必须是 JSON 对象")
@@ -98,12 +127,27 @@ def validate_payload(body):
     if any(not k for k in keys) or len(set(keys)) != len(keys):
         raise ApiError(400, "事件 key 缺失或重复")
     key_set = set(keys)
+    name_by_key = {e["key"]: e["name"] for e in events}
     relations = []
     for r in body.get("relations") or []:
+        if not isinstance(r, dict):
+            raise ApiError(400, "“先于”关系格式不正确")
         a, b = str(r.get("predecessor_key") or ""), str(r.get("successor_key") or "")
         if a not in key_set or b not in key_set:
             raise ApiError(400, "“先于”关系引用了不存在的事件")
-        relations.append({"predecessor_key": a, "successor_key": b})
+        desc = "「{}」先于「{}」".format(name_by_key[a], name_by_key[b])
+        min_gap = _norm_gap(r.get("min_gap_minutes"), "最短等待", desc)
+        if min_gap is None:
+            min_gap = 0  # 未设置：沿用旧语义（前项结束不晚于后项开始）
+        max_gap = _norm_gap(r.get("max_gap_minutes"), "最长等待", desc)
+        if max_gap is not None and max_gap < min_gap:
+            raise ApiError(400, "关系{}的最长等待不得短于最短等待".format(desc))
+        relations.append({
+            "predecessor_key": a,
+            "successor_key": b,
+            "min_gap_minutes": min_gap,
+            "max_gap_minutes": max_gap,
+        })
     return body["base_version"], title, events, relations
 
 

@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS relations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
     predecessor_id INTEGER NOT NULL,
-    successor_id   INTEGER NOT NULL
+    successor_id   INTEGER NOT NULL,
+    min_gap_minutes INTEGER NOT NULL DEFAULT 0,    -- 前项结束到后项开始的最短等待
+    max_gap_minutes INTEGER                        -- 最长等待，NULL = 不限
 );
 CREATE TABLE IF NOT EXISTS computations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,16 +94,31 @@ def _now():
 
 
 def init_db(db_path):
-    """启动时初始化数据库（建目录、建表）。"""
+    """启动时初始化数据库（建目录、建表、老库结构迁移）。"""
     directory = os.path.dirname(os.path.abspath(db_path))
     os.makedirs(directory, exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate(conn)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate(conn):
+    """老库结构升级（幂等）：relations 补充“先于”间隔设置列。
+
+    升级前已存在的关系行由列默认值得到 最短等待=0、最长等待=NULL（不限），
+    与旧语义“前项结束不晚于后项开始”完全一致。
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(relations)")}
+    if "min_gap_minutes" not in cols:
+        conn.execute(
+            "ALTER TABLE relations ADD COLUMN min_gap_minutes INTEGER NOT NULL DEFAULT 0")
+    if "max_gap_minutes" not in cols:
+        conn.execute("ALTER TABLE relations ADD COLUMN max_gap_minutes INTEGER")
 
 
 def connect(db_path):
@@ -280,6 +297,16 @@ def create_review(db_path, title):
         conn.close()
 
 
+def _snapshot_relations(relations, key_by_id):
+    """快照用的关系列表（key 引用 + 当时的间隔设置），供回看与恢复使用。"""
+    return [{
+        "predecessor_key": key_by_id.get(r["predecessor_id"], ""),
+        "successor_key": key_by_id.get(r["successor_id"], ""),
+        "min_gap_minutes": r.get("min_gap_minutes") or 0,
+        "max_gap_minutes": r.get("max_gap_minutes"),
+    } for r in relations]
+
+
 def _current_input(conn, review_id):
     """读取当前 live 输入，事件按插入顺序生成 key，关系用 key 引用。"""
     events = [dict(r) for r in conn.execute(
@@ -295,10 +322,7 @@ def _current_input(conn, review_id):
         "duration_minutes": e["duration_minutes"],
         "note": e["note"],
     } for e in events]
-    snapshot_relations = [{
-        "predecessor_key": key_by_id.get(r["predecessor_id"], ""),
-        "successor_key": key_by_id.get(r["successor_id"], ""),
-    } for r in relations]
+    snapshot_relations = _snapshot_relations(relations, key_by_id)
     return events, relations, snapshot_events, snapshot_relations
 
 
@@ -324,10 +348,7 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
         "duration_minutes": e["duration_minutes"],
         "note": e["note"],
     } for e in events]
-    snapshot_relations = [{
-        "predecessor_key": key_by_id.get(r["predecessor_id"], ""),
-        "successor_key": key_by_id.get(r["successor_id"], ""),
-    } for r in relations]
+    snapshot_relations = _snapshot_relations(relations, key_by_id)
     input_json = json.dumps(
         {"events": snapshot_events, "relations": snapshot_relations}, ensure_ascii=False)
     conn.execute(
@@ -350,9 +371,12 @@ def _replace_input(conn, review_id, events, relations):
              e.get("duration_minutes"), e.get("note", "")))
         key_to_id[e["key"]] = cur.lastrowid
     for r in relations:
+        min_gap = r.get("min_gap_minutes")
         conn.execute(
-            "INSERT INTO relations (review_id, predecessor_id, successor_id) VALUES (?,?,?)",
-            (review_id, key_to_id[r["predecessor_key"]], key_to_id[r["successor_key"]]))
+            "INSERT INTO relations (review_id, predecessor_id, successor_id,"
+            " min_gap_minutes, max_gap_minutes) VALUES (?,?,?,?,?)",
+            (review_id, key_to_id[r["predecessor_key"]], key_to_id[r["successor_key"]],
+             0 if min_gap is None else min_gap, r.get("max_gap_minutes")))
 
 
 def update_review(db_path, review_id, base_version, title, events, relations):

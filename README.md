@@ -7,20 +7,25 @@
 ## 功能
 
 - **事件建模**：每个事件包含起始时间范围（最早/最晚开始）、持续分钟数与备注。
-- **“先于”约束**：A 先于 B 表示 A 必须在 B 开始前结束（A 开始 + A 持续 ≤ B 开始）。
-- **时间窗推算**：前向/后向约束传播，给出每个事件的最早/最晚可行开始（即可行时间窗），
-  并展示从输入到结论的完整依据链。
+- **“先于”约束（含间隔设置）**：A 先于 B 表示 A 结束后 B 才能开始。每条关系可设置
+  **最短等待**（非负整数分钟，缺省 0）与**最长等待**（非负整数分钟，可空 = 不限），
+  即 `A 结束 + 最短等待 ≤ B 开始 ≤ A 结束 + 最长等待`。未设置间隔的旧关系仍按旧语义
+  `A 开始 + A 持续 ≤ B 开始` 推算，结果与升级前一致。最长等待不得短于最短等待，
+  非法输入（负数、非整数、最长 < 最短）会被拒绝（HTTP 400）且不改任何记录。
+- **时间窗推算**：前向/后向约束传播，同时施加每条关系的间隔上下界，给出每个事件的
+  最早/最晚可行开始（即可行时间窗），并展示从输入到结论的完整依据链（含间隔取值）。
 - **输入与结果分离保存**：原始输入存于 `events` / `relations` 表，每次保存的推算结果
   单独写入 `computations` 表（按复盘版本留存），互不覆盖。
 - **版本回看与恢复**：每次保存/定稿成功时，除推算结果外另写一条**不可变输入快照**
-  （标题、事件、“先于”关系）到 `snapshots` 表，与当次推算一一对应。网页和 HTTP API
-  可列出各版本、回看当时输入与推算依据；把指定版本恢复时会**另存为当前复盘的新草稿
-  版本**并重新推算，不覆盖任何旧版本。恢复须携带当前 `base_version`，版本过期沿用
-  409 冲突语义。冲突或暂存输入允许恢复，但仍不得定稿。
+  （标题、事件、“先于”关系及各自的间隔设置）到 `snapshots` 表，与当次推算一一对应。
+  网页和 HTTP API 可列出各版本、回看当时输入与推算依据；把指定版本恢复时会
+  **另存为当前复盘的新草稿版本**并重新推算，不覆盖任何旧版本。恢复须携带当前
+  `base_version`，版本过期沿用 409 冲突语义。冲突或暂存输入允许恢复，但仍不得定稿。
 - **旧库历史版本**：升级前只有推算结果、缺少完整输入快照的历史版本，会在版本列表中
   明确标记为「不可回看、不可恢复」，不会用当前输入冒充；老接口行为保持不变。
 - **冲突处理**：约束冲突（窗口不可满足、关系成环、输入范围自相矛盾）时保留全部输入，
-  指出冲突事件及双方依据链，该版本**不得定稿**。
+  指出冲突事件及双方依据链（正推最早可行开始与反推最晚可行开始两条相反依据链），
+  该版本**不得定稿**。
 - **暂存事件**：缺少时间范围（或持续分钟数）的事件可暂存，其关联的“先于”关系
   暂不参与推算，并在页面上标明原因；存在暂存事件时同样不得定稿。
 - **多人协作并发控制**：基于 `reviews.version` 的乐观锁。携带旧版本号的提交会被
@@ -61,8 +66,9 @@ Compose 示例（`docker-compose.yml`）中已包含命名卷 `timeline-data` �
 ```bash
 python3 app/server.py          # 默认监听 8000，数据库写入 ./data/timeline.db
 PORT=9000 DB_PATH=/tmp/t.db python3 app/server.py
-python3 tests/test_compute.py  # 推算引擎单元测试
+python3 tests/test_compute.py  # 推算引擎单元测试（含间隔上下界）
 python3 tests/test_versions.py # 版本快照/回看/恢复、旧库兼容单元测试
+python3 tests/test_api.py      # HTTP API 端到端测试（间隔校验、409、恢复保留间隔）
 ```
 
 ## HTTP API 简介
@@ -72,7 +78,7 @@ python3 tests/test_versions.py # 版本快照/回看/恢复、旧库兼容单元
 | GET | `/api/reviews` | 复盘列表 |
 | POST | `/api/reviews` | 新建复盘 `{title}` |
 | GET | `/api/reviews/{id}` | 复盘快照：元信息 + 原始输入 + 最近一次推算结果 |
-| PUT | `/api/reviews/{id}` | 整体保存并重新推算 `{base_version, title, events, relations}`；版本过期返回 409 |
+| PUT | `/api/reviews/{id}` | 整体保存并重新推算 `{base_version, title, events, relations}`；关系可带 `min_gap_minutes` / `max_gap_minutes`；版本过期返回 409，间隔非法返回 400 |
 | POST | `/api/reviews/{id}/finalize` | 定稿 `{base_version}`；有冲突或暂存事件返回 400 |
 | GET | `/api/reviews/{id}/versions` | 版本列表（含回看/恢复标记；旧库无快照版本 `reviewable=false`） |
 | GET | `/api/reviews/{id}/versions/{v}` | 版本回看：当时标题/事件/关系输入 + 推算依据与状态；旧库无快照返回 422 |
@@ -111,14 +117,65 @@ curl -s -X POST http://localhost:8000/api/reviews/1/versions/3/restore \
 定稿产生的新版本会标注「已定稿」并沿用同一输入；由恢复产生的版本标注「恢复产生」并
 记录来源版本。
 
+### “先于”关系的间隔设置（HTTP 示例）
+
+每条关系可携带 `min_gap_minutes`（最短等待，非负整数分钟，缺省 0）与
+`max_gap_minutes`（最长等待，非负整数分钟，可空/缺省 = 不限）：
+
+```bash
+# 1) 保存：告警结束后 10~60 分钟内值班必须响应
+curl -s -X PUT http://localhost:8000/api/reviews/1 \
+  -H 'Content-Type: application/json' -d '{
+    "base_version": 1, "title": "支付故障复盘",
+    "events": [
+      {"key": "a", "name": "告警触发",
+       "earliest_start": "2026-10-01T10:00", "latest_start": "2026-10-01T10:30",
+       "duration_minutes": 15},
+      {"key": "b", "name": "值班响应",
+       "earliest_start": "2026-10-01T10:00", "latest_start": "2026-10-01T12:00",
+       "duration_minutes": 30}
+    ],
+    "relations": [
+      {"predecessor_key": "a", "successor_key": "b",
+       "min_gap_minutes": 10, "max_gap_minutes": 60}
+    ]}'
+# 推算同时施加间隔上下界：
+#   值班响应可行窗口 10:25 ~ 11:45
+#   依据链示例：「告警触发」先于「值班响应」且「告警触发」持续 15 分钟、
+#   最短等待 10 分钟 ⇒ 「值班响应」最早开始不早于 2026-10-01T10:25
+
+# 2) 非法间隔被拒绝（HTTP 400），记录保持不变
+curl -s -X PUT http://localhost:8000/api/reviews/1 \
+  -H 'Content-Type: application/json' -d '{
+    "base_version": 2, "title": "支付故障复盘", "events": [...],
+    "relations": [{"predecessor_key": "a", "successor_key": "b",
+                   "min_gap_minutes": 60, "max_gap_minutes": 10}]}'
+# 400 {"error": "关系「告警触发」先于「值班响应」的最长等待不得短于最短等待"}
+
+# 3) 版本回看/恢复保留每条关系当时的间隔设置
+curl -s http://localhost:8000/api/reviews/1/versions/2
+#  "input": {"relations": [{"predecessor_key": "id_1", "successor_key": "id_2",
+#                           "min_gap_minutes": 10, "max_gap_minutes": 60}], ...}
+curl -s -X POST http://localhost:8000/api/reviews/1/versions/2/restore \
+  -H 'Content-Type: application/json' -d '{"base_version": 3}'
+# 新草稿版本的关系同样带 min_gap_minutes=10, max_gap_minutes=60；旧版本不被覆盖。
+```
+
+不设置间隔的关系（包括升级前保存的旧关系）按 `min_gap_minutes=0`、
+`max_gap_minutes=null` 处理，推算结果与旧版完全一致。间隔约束与输入范围冲突时
+（例如最长等待小于前项结束到后项最早开始的距离），推算状态为 `conflict`，
+冲突明细中给出冲突事件与正/反两条依据链，输入保留但不得定稿。
+
 ## 目录结构
 
 ```
 app/
-  server.py          HTTP 服务（标准库 http.server）
-  db.py              SQLite 持久化、乐观锁、启动时建表
-  compute.py         时间窗推算与依据链生成
+  server.py          HTTP 服务（标准库 http.server）、间隔设置校验
+  db.py              SQLite 持久化、乐观锁、启动时建表与老库迁移
+  compute.py         时间窗推算与依据链生成（含间隔上下界传播）
   static/            浏览器单页界面（原生 HTML/JS/CSS）
 tests/test_compute.py  推算引擎单元测试
+tests/test_versions.py 版本快照/回看/恢复与旧库兼容测试
+tests/test_api.py      HTTP API 端到端测试
 Dockerfile / docker-compose.yml / .dockerignore
 ```

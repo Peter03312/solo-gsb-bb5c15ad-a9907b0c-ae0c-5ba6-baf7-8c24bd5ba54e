@@ -87,12 +87,16 @@ td .row-del { padding: 2px 8px; }
 
 .relation-add { display: flex; gap: 8px; align-items: center; margin-bottom: 8px; flex-wrap: wrap; }
 .relation-add select { max-width: 220px; }
+.gap-field { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 4px; }
+.gap-field input, .rel-gaps input { width: 64px; }
 ul.relations { list-style: none; margin: 0; padding: 0; }
 ul.relations li {
-  display: flex; justify-content: space-between; align-items: center;
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
   padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px;
-  background: var(--panel2);
+  background: var(--panel2); flex-wrap: wrap;
 }
+.rel-gaps { display: flex; gap: 10px; align-items: center; margin-left: auto; }
+.rel-gaps label { color: var(--muted); font-size: 12px; display: flex; align-items: center; gap: 4px; }
 
 .summary { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-weight: 600; }
 .summary.ok { background: rgba(47,191,113,.12); border: 1px solid var(--ok); color: var(--ok); }

@@ -22,6 +22,15 @@ def ev(key, name, es, ls, dur):
             "duration_minutes": dur, "note": ""}
 
 
+def rel(a, b, min_g=None, max_g=None):
+    r = {"predecessor_key": a, "successor_key": b}
+    if min_g is not None:
+        r["min_gap_minutes"] = min_g
+    if max_g is not None:
+        r["max_gap_minutes"] = max_g
+    return r
+
+
 def setup_db():
     tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     tmp.close()
@@ -41,9 +50,10 @@ def test_save_creates_immutable_snapshot():
     assert detail["title"] == "二版标题"
     assert detail["kind"] == "save" and detail["state"] == "draft"
     keys = [e["key"] for e in detail["input"]["events"]]
-    # 快照事件 key 与推算结果窗口 id 可互相对应
+    # 快照事件 key 与推算结果窗口 id 可互相对应；未设置间隔的关系按默认值留存
     assert detail["input"]["relations"] == [
-        {"predecessor_key": keys[0], "successor_key": keys[1]}]
+        {"predecessor_key": keys[0], "successor_key": keys[1],
+         "min_gap_minutes": 0, "max_gap_minutes": None}]
     win_key = keys[1].replace("id_", "")
     assert detail["result"]["windows"][win_key]["earliest_start"] == "2026-10-01T10:15"
 
@@ -188,6 +198,98 @@ def test_legacy_db_still_starts_and_writes_new_snapshots():
     assert rows[0]["version"] == 1 and rows[0]["reviewable"] is False
     rid = db.create_review(tmp.name, "新")
     assert db.get_version(tmp.name, rid, 1)["reviewable"] is True
+
+
+def test_gaps_preserved_in_save_review_restore():
+    p = setup_db()
+    rid = db.create_review(p, "间隔")
+    e1 = ev("a", "告警", "2026-10-01T10:00", "2026-10-01T10:30", 15)
+    e2 = ev("b", "响应", "2026-10-01T10:00", "2026-10-01T12:00", 30)
+    db.update_review(p, rid, 1, "间隔", [e1, e2], [rel("a", "b", min_g=10, max_g=60)])  # v2
+    db.update_review(p, rid, 2, "间隔", [e1, e2], [rel("a", "b", min_g=0)])            # v3
+
+    # 保存时的快照保留当时间隔设置
+    r2 = db.get_version(p, rid, 2)["input"]["relations"][0]
+    assert r2["min_gap_minutes"] == 10 and r2["max_gap_minutes"] == 60
+    r3 = db.get_version(p, rid, 3)["input"]["relations"][0]
+    assert r3["min_gap_minutes"] == 0 and r3["max_gap_minutes"] is None
+    # v2 的推算应用了间隔：响应最早开始 = 10:00 + 15 + 10
+    keys = [e["key"] for e in db.get_version(p, rid, 2)["input"]["events"]]
+    win = db.get_version(p, rid, 2)["result"]["windows"][keys[1].replace("id_", "")]
+    assert win["earliest_start"] == "2026-10-01T10:25"
+
+    # live 输入与恢复都保留间隔
+    db.restore_review(p, rid, 3, 2)  # v4 恢复 v2
+    live = db.get_bundle(p, rid)["relations"][0]
+    assert live["min_gap_minutes"] == 10 and live["max_gap_minutes"] == 60
+    r4 = db.get_version(p, rid, 4)["input"]["relations"][0]
+    assert r4["min_gap_minutes"] == 10 and r4["max_gap_minutes"] == 60
+    # 旧版本快照不被覆盖
+    assert db.get_version(p, rid, 3)["input"]["relations"][0]["max_gap_minutes"] is None
+
+
+def test_restore_legacy_snapshot_without_gaps():
+    # 旧快照（无间隔字段）恢复后按旧语义推算：最短等待 0、最长等待不限
+    p = setup_db()
+    rid = db.create_review(p, "T")
+    e1 = ev("a", "A", "2026-10-01T10:00", "2026-10-01T10:30", 15)
+    e2 = ev("b", "B", "2026-10-01T10:00", "2026-10-01T12:00", 30)
+    db.update_review(p, rid, 1, "T", [e1, e2], [rel("a", "b")])  # v2
+    # 模拟旧库快照：删掉间隔字段
+    conn = sqlite3.connect(p)
+    snap = conn.execute(
+        "SELECT input_json FROM snapshots WHERE review_id=? AND review_version=2",
+        (rid,)).fetchone()[0]
+    import json as _json
+    data = _json.loads(snap)
+    for r in data["relations"]:
+        r.pop("min_gap_minutes", None)
+        r.pop("max_gap_minutes", None)
+    conn.execute("UPDATE snapshots SET input_json=? WHERE review_id=? AND review_version=2",
+                 (_json.dumps(data, ensure_ascii=False), rid))
+    conn.commit()
+    conn.close()
+
+    db.restore_review(p, rid, 2, 2)  # v3
+    live = db.get_bundle(p, rid)["relations"][0]
+    assert live["min_gap_minutes"] == 0 and live["max_gap_minutes"] is None
+    win_b = db.get_bundle(p, rid)["computation"]["result"]["windows"]
+    assert win_b[str(live["successor_id"])]["earliest_start"] == "2026-10-01T10:15"
+
+
+def test_legacy_relations_table_migrated_with_defaults():
+    # 旧库（relations 无间隔列）启动迁移后：旧行按默认值保留，推算沿用旧语义
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    conn = sqlite3.connect(tmp.name)
+    conn.executescript(
+        "CREATE TABLE reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,"
+        " status TEXT NOT NULL DEFAULT 'draft', version INTEGER NOT NULL DEFAULT 1,"
+        " created_at TEXT, updated_at TEXT);"
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, review_id INTEGER,"
+        " name TEXT, earliest_start TEXT, latest_start TEXT, duration_minutes INTEGER,"
+        " note TEXT DEFAULT '');"
+        "CREATE TABLE relations (id INTEGER PRIMARY KEY AUTOINCREMENT, review_id INTEGER,"
+        " predecessor_id INTEGER, successor_id INTEGER);"
+        "CREATE TABLE computations (id INTEGER PRIMARY KEY AUTOINCREMENT, review_id INTEGER,"
+        " review_version INTEGER, status TEXT, result_json TEXT, computed_at TEXT);"
+        "INSERT INTO reviews VALUES (1,'旧','draft',1,'t','t');"
+        "INSERT INTO events VALUES (1,1,'A','2026-10-01T10:00','2026-10-01T10:30',15,'');"
+        "INSERT INTO events VALUES (2,1,'B','2026-10-01T10:00','2026-10-01T12:00',30,'');"
+        "INSERT INTO relations VALUES (1,1,1,2);")
+    conn.commit()
+    conn.close()
+
+    db.init_db(tmp.name)  # 迁移：补间隔列
+    bundle = db.get_bundle(tmp.name, 1)
+    r = bundle["relations"][0]
+    assert r["min_gap_minutes"] == 0 and r["max_gap_minutes"] is None
+    # 新保存可携带间隔，且旧关系行不受影响
+    e1 = ev("a", "A", "2026-10-01T10:00", "2026-10-01T10:30", 15)
+    e2 = ev("b", "B", "2026-10-01T10:00", "2026-10-01T12:00", 30)
+    db.update_review(tmp.name, 1, 1, "旧", [e1, e2], [rel("a", "b", min_g=20)])
+    live = db.get_bundle(tmp.name, 1)["relations"][0]
+    assert live["min_gap_minutes"] == 20
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]
