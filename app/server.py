@@ -8,6 +8,9 @@
   POST   /api/reviews             新建复盘  {title}
   GET    /api/reviews/{id}        复盘快照（输入 + 最近一次推算结果）
   PUT    /api/reviews/{id}        整体保存并重新推算  {base_version, title, events, relations}
+                                   relations 每条可带 min_wait_minutes（非负整数，默认 0）
+                                   与 max_wait_minutes（非负整数或 null；null=不限）；
+                                   最长不得短于最短，非法间隔 400 且不写库
   POST   /api/reviews/{id}/finalize  定稿  {base_version}
   GET    /api/reviews/{id}/versions       可回看版本列表（含不可回看的旧库历史版本标记）
   GET    /api/reviews/{id}/versions/{v}   某版本回看：当时输入 + 推算依据 + 状态
@@ -99,12 +102,57 @@ def validate_payload(body):
         raise ApiError(400, "事件 key 缺失或重复")
     key_set = set(keys)
     relations = []
+    name_by_key = {e["key"]: e["name"] for e in events}
     for r in body.get("relations") or []:
+        if not isinstance(r, dict):
+            raise ApiError(400, "“先于”关系格式不正确")
         a, b = str(r.get("predecessor_key") or ""), str(r.get("successor_key") or "")
         if a not in key_set or b not in key_set:
             raise ApiError(400, "“先于”关系引用了不存在的事件")
-        relations.append({"predecessor_key": a, "successor_key": b})
+        rel_label = "「{}」先于「{}」".format(name_by_key.get(a, a), name_by_key.get(b, b))
+        min_wait, max_wait = _validate_waits(r, rel_label)
+        relations.append({
+            "predecessor_key": a,
+            "successor_key": b,
+            "min_wait_minutes": min_wait,
+            "max_wait_minutes": max_wait,
+        })
     return body["base_version"], title, events, relations
+
+
+def _validate_waits(r, rel_label):
+    """校验关系间隔：最短等待为非负整数，最长等待可选且不短于最短等待。
+
+    任何非法输入都抛 400；调用方在写库前完成校验，故不会改动任何记录。
+    """
+    limit = 30 * 24 * 60  # 30 天，与事件持续时长的上限一致
+
+    def norm_wait(value, label, required):
+        if value is None or value == "":
+            if required:
+                raise ApiError(400, "{}的{}必须是非负整数".format(rel_label, label))
+            return None
+        if isinstance(value, bool):
+            raise ApiError(400, "{}的{}必须是非负整数".format(rel_label, label))
+        try:
+            wait = int(value)
+            if not isinstance(value, int) and float(value) != wait:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ApiError(400, "{}的{}必须是非负整数".format(rel_label, label))
+        if not 0 <= wait <= limit:
+            raise ApiError(400, "{}的{}超出合理范围（0～{} 分钟）".format(rel_label, label, limit))
+        return wait
+
+    min_wait = norm_wait(r.get("min_wait_minutes"), "最短等待", required=False)
+    if min_wait is None:
+        min_wait = 0  # 未设置即沿用旧语义：前项结束不晚于后项开始
+    max_wait = norm_wait(r.get("max_wait_minutes"), "最长等待", required=False)
+    if max_wait is not None and max_wait < min_wait:
+        raise ApiError(
+            400, "{}的最长等待 {} 分钟不得短于最短等待 {} 分钟".format(
+                rel_label, max_wait, min_wait))
+    return min_wait, max_wait
 
 
 class Handler(BaseHTTPRequestHandler):

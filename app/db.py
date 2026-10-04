@@ -41,7 +41,9 @@ CREATE TABLE IF NOT EXISTS relations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
     review_id      INTEGER NOT NULL REFERENCES reviews(id) ON DELETE CASCADE,
     predecessor_id INTEGER NOT NULL,
-    successor_id   INTEGER NOT NULL
+    successor_id   INTEGER NOT NULL,
+    min_wait_minutes INTEGER NOT NULL DEFAULT 0,  -- 前项结束→后项开始的最短等待（分钟）
+    max_wait_minutes INTEGER                      -- 最长等待（分钟），NULL 表示不限
 );
 CREATE TABLE IF NOT EXISTS computations (
     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -92,16 +94,28 @@ def _now():
 
 
 def init_db(db_path):
-    """启动时初始化数据库（建目录、建表）。"""
+    """启动时初始化数据库（建目录、建表；对旧库补齐关系间隔列）。"""
     directory = os.path.dirname(os.path.abspath(db_path))
     os.makedirs(directory, exist_ok=True)
     conn = sqlite3.connect(db_path)
     try:
         conn.executescript(SCHEMA)
+        _migrate_relation_waits(conn)
         conn.execute("PRAGMA journal_mode=WAL")
         conn.commit()
     finally:
         conn.close()
+
+
+def _migrate_relation_waits(conn):
+    """旧库 relations 表缺少间隔列时补齐；存量行沿用旧语义（min=0/max 不限）。"""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(relations)")}
+    if cols:
+        if "min_wait_minutes" not in cols:
+            conn.execute(
+                "ALTER TABLE relations ADD COLUMN min_wait_minutes INTEGER NOT NULL DEFAULT 0")
+        if "max_wait_minutes" not in cols:
+            conn.execute("ALTER TABLE relations ADD COLUMN max_wait_minutes INTEGER")
 
 
 def connect(db_path):
@@ -298,6 +312,8 @@ def _current_input(conn, review_id):
     snapshot_relations = [{
         "predecessor_key": key_by_id.get(r["predecessor_id"], ""),
         "successor_key": key_by_id.get(r["successor_id"], ""),
+        "min_wait_minutes": r["min_wait_minutes"] if r["min_wait_minutes"] is not None else 0,
+        "max_wait_minutes": r["max_wait_minutes"],
     } for r in relations]
     return events, relations, snapshot_events, snapshot_relations
 
@@ -327,6 +343,8 @@ def _save_version(conn, review_id, version, title, events, relations, kind, now=
     snapshot_relations = [{
         "predecessor_key": key_by_id.get(r["predecessor_id"], ""),
         "successor_key": key_by_id.get(r["successor_id"], ""),
+        "min_wait_minutes": r["min_wait_minutes"] if r["min_wait_minutes"] is not None else 0,
+        "max_wait_minutes": r["max_wait_minutes"],
     } for r in relations]
     input_json = json.dumps(
         {"events": snapshot_events, "relations": snapshot_relations}, ensure_ascii=False)
@@ -351,8 +369,10 @@ def _replace_input(conn, review_id, events, relations):
         key_to_id[e["key"]] = cur.lastrowid
     for r in relations:
         conn.execute(
-            "INSERT INTO relations (review_id, predecessor_id, successor_id) VALUES (?,?,?)",
-            (review_id, key_to_id[r["predecessor_key"]], key_to_id[r["successor_key"]]))
+            "INSERT INTO relations (review_id, predecessor_id, successor_id,"
+            " min_wait_minutes, max_wait_minutes) VALUES (?,?,?,?,?)",
+            (review_id, key_to_id[r["predecessor_key"]], key_to_id[r["successor_key"]],
+             int(r.get("min_wait_minutes") or 0), r.get("max_wait_minutes")))
 
 
 def update_review(db_path, review_id, base_version, title, events, relations):

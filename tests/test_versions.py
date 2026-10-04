@@ -41,9 +41,10 @@ def test_save_creates_immutable_snapshot():
     assert detail["title"] == "二版标题"
     assert detail["kind"] == "save" and detail["state"] == "draft"
     keys = [e["key"] for e in detail["input"]["events"]]
-    # 快照事件 key 与推算结果窗口 id 可互相对应
+    # 快照关系保留当时的间隔设置（未设置时按旧语义 min=0/max=None）
     assert detail["input"]["relations"] == [
-        {"predecessor_key": keys[0], "successor_key": keys[1]}]
+        {"predecessor_key": keys[0], "successor_key": keys[1],
+         "min_wait_minutes": 0, "max_wait_minutes": None}]
     win_key = keys[1].replace("id_", "")
     assert detail["result"]["windows"][win_key]["earliest_start"] == "2026-10-01T10:15"
 
@@ -188,6 +189,92 @@ def test_legacy_db_still_starts_and_writes_new_snapshots():
     assert rows[0]["version"] == 1 and rows[0]["reviewable"] is False
     rid = db.create_review(tmp.name, "新")
     assert db.get_version(tmp.name, rid, 1)["reviewable"] is True
+
+
+def rel(pre, suc, min_wait=0, max_wait=None):
+    r = {"predecessor_key": pre, "successor_key": suc,
+         "min_wait_minutes": min_wait}
+    r["max_wait_minutes"] = max_wait
+    return r
+
+
+def test_relation_waits_persist_live_and_snapshot():
+    p = setup_db()
+    rid = db.create_review(p, "T")
+    events = [ev("a", "告警", "2026-10-01T10:00", "2026-10-01T10:30", 15),
+              ev("b", "响应", "2026-10-01T10:00", "2026-10-01T12:00", 30)]
+    db.update_review(p, rid, 1, "T", events, [rel("a", "b", 10, 45)])  # v2
+
+    bundle = db.get_bundle(p, rid)
+    assert bundle["relations"][0]["min_wait_minutes"] == 10
+    assert bundle["relations"][0]["max_wait_minutes"] == 45
+
+    # 不可变快照保留当时的间隔设置
+    v2 = db.get_version(p, rid, 2)
+    assert v2["input"]["relations"] == [{
+        "predecessor_key": v2["input"]["events"][0]["key"],
+        "successor_key": v2["input"]["events"][1]["key"],
+        "min_wait_minutes": 10, "max_wait_minutes": 45}]
+
+    # 修改间隔后另存 v3：旧版本 v2 的间隔不被覆盖
+    db.update_review(p, rid, 2, "T", events, [rel("a", "b", 5, None)])  # v3
+    assert db.get_version(p, rid, 2)["input"]["relations"][0]["max_wait_minutes"] == 45
+    assert db.get_version(p, rid, 3)["input"]["relations"][0]["min_wait_minutes"] == 5
+    assert db.get_version(p, rid, 3)["input"]["relations"][0]["max_wait_minutes"] is None
+
+    # 恢复 v2：间隔设置随快照一并恢复，并按当时间隔重新推算
+    db.restore_review(p, rid, 3, 2)  # v4
+    bundle = db.get_bundle(p, rid)
+    assert bundle["relations"][0]["min_wait_minutes"] == 10
+    assert bundle["relations"][0]["max_wait_minutes"] == 45
+    # B 最早开始 = 10:00 + 15 + 10 = 10:25
+    assert bundle["computation"]["result"]["windows"][str(bundle["events"][1]["id"])][
+        "earliest_start"] == "2026-10-01T10:25"
+
+
+def test_finalize_snapshot_keeps_waits():
+    p = setup_db()
+    rid = db.create_review(p, "T")
+    events = [ev("a", "A", "2026-10-01T10:00", "2026-10-01T12:00", 10),
+              ev("b", "B", "2026-10-01T10:00", "2026-10-01T13:00", 5)]
+    db.update_review(p, rid, 1, "T", events, [rel("a", "b", 20, 120)])  # v2
+    db.finalize_review(p, rid, 2)                                          # v3
+    v3 = db.get_version(p, rid, 3)
+    assert v3["kind"] == "finalize"
+    assert v3["input"]["relations"][0]["min_wait_minutes"] == 20
+    assert v3["input"]["relations"][0]["max_wait_minutes"] == 120
+
+
+def test_legacy_relation_rows_get_default_waits():
+    # 旧库 relations 表无间隔列：迁移后补齐，存量行沿用旧语义 min=0/max=None
+    tmp = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    tmp.close()
+    conn = sqlite3.connect(tmp.name)
+    conn.executescript(
+        "CREATE TABLE reviews (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL,"
+        " status TEXT NOT NULL DEFAULT 'draft', version INTEGER NOT NULL DEFAULT 1,"
+        " created_at TEXT, updated_at TEXT);"
+        "CREATE TABLE events (id INTEGER PRIMARY KEY AUTOINCREMENT, review_id INTEGER,"
+        " name TEXT, earliest_start TEXT, latest_start TEXT, duration_minutes INTEGER,"
+        " note TEXT DEFAULT '');"
+        "CREATE TABLE relations (id INTEGER PRIMARY KEY AUTOINCREMENT, review_id INTEGER,"
+        " predecessor_id INTEGER, successor_id INTEGER);"
+        "CREATE TABLE computations (id INTEGER PRIMARY KEY AUTOINCREMENT, review_id INTEGER,"
+        " review_version INTEGER, status TEXT, result_json TEXT, computed_at TEXT);"
+        "INSERT INTO reviews VALUES (1,'旧','draft',1,'t','t');"
+        "INSERT INTO events VALUES (1,1,'A','2026-10-01T10:00','2026-10-01T11:00',10,'');"
+        "INSERT INTO events VALUES (2,1,'B','2026-10-01T10:00','2026-10-01T12:00',10,'');"
+        "INSERT INTO relations VALUES (1,1,1,2);"
+        "INSERT INTO computations VALUES (1,1,1,'ok','{}','t');")
+    conn.commit()
+    conn.close()
+
+    db.init_db(tmp.name)  # 迁移：补间隔列
+    cols = {r[1] for r in sqlite3.connect(tmp.name).execute("PRAGMA table_info(relations)")}
+    assert {"min_wait_minutes", "max_wait_minutes"} <= cols
+    bundle = db.get_bundle(tmp.name, 1)
+    assert bundle["relations"][0]["min_wait_minutes"] == 0
+    assert bundle["relations"][0]["max_wait_minutes"] is None
 
 
 TESTS = [v for k, v in sorted(globals().items()) if k.startswith("test_")]

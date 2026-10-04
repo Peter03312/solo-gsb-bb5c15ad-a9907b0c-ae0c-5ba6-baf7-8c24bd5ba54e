@@ -1,11 +1,18 @@
 """时间窗推算引擎。
 
-输入：事件（起始时间范围 + 持续分钟数）与“先于”关系（A 先于 B 表示
-A 必须在 B 开始前结束，即 A.start + A.duration <= B.start）。
+输入：事件（起始时间范围 + 持续分钟数）与“先于”关系。A 先于 B 表示
+A 必须在 B 开始前结束，并可附带“前项结束 → 后项开始”的允许间隔（分钟）：
 
-输出：每个事件的可行开始时间窗（最早/最晚可行开始）及推算依据链；
-约束冲突时给出冲突事件、冲突类型与双方依据链；缺少时间范围的事件
-作为“暂存”处理，其关联关系不参与推算并标明原因。
+  - min_wait_minutes：最短等待（非负整数，缺省 0），B.start ≥ A.start + A.duration + min
+  - max_wait_minutes：最长等待（非负整数或 None；None 表示不限），
+                      B.start ≤ A.start + A.duration + max
+
+未设置间隔的旧关系等价于 min=0、max=None，即“A 结束不晚于 B 开始”的旧语义。
+
+输出：每个完整事件的可行开始时间窗（最早/最晚可行开始）及推算依据链；
+约束冲突（窗口不可满足、关系成环、输入范围自相矛盾）时给出冲突事件、
+冲突类型与前向/后向（相反方向）依据链；缺少时间范围的事件作为“暂存”
+处理，其关联关系不参与推算并标明原因。
 """
 
 from datetime import datetime, timedelta
@@ -19,12 +26,33 @@ def _fmt(dt):
     return dt.isoformat(timespec="minutes")
 
 
+def _norm_waits(r):
+    """读取关系上的间隔设置，缺省按旧语义 min=0 / max=None。"""
+    minw = r.get("min_wait_minutes")
+    minw = int(minw) if minw is not None else 0
+    maxw = r.get("max_wait_minutes")
+    maxw = int(maxw) if maxw is not None else None
+    return minw, maxw
+
+
+def _wait_paren(minw, maxw):
+    """间隔设置的简短说明，作为关系描述的括注。"""
+    if maxw is None:
+        return "" if minw == 0 else "（至少等待 {} 分钟）".format(minw)
+    if maxw == minw:
+        return "（须恰好等待 {} 分钟）".format(minw)
+    if minw == 0:
+        return "（至多等待 {} 分钟）".format(maxw)
+    return "（须等待 {}～{} 分钟）".format(minw, maxw)
+
+
 def compute(events, relations):
     """推算时间窗。
 
     events:   [{"id", "name", "earliest_start", "latest_start", "duration_minutes"}]
               时间字段为 ISO 字符串或 None；duration_minutes 为整数或 None。
-    relations: [{"id", "predecessor_id", "successor_id"}]
+    relations: [{"id", "predecessor_id", "successor_id",
+                 "min_wait_minutes"?, "max_wait_minutes"?}]
 
     返回 dict：
       status            "ok" | "conflict"
@@ -32,7 +60,8 @@ def compute(events, relations):
                                     latest_end, earliest_chain, latest_chain}}
       conflicts         [{type, event_ids, message, ...}]
       drafts            [{id, name, reason}]            暂存事件（不参与推算）
-      skipped_relations [{id, predecessor_id, successor_id, reason}]
+      skipped_relations [{id, predecessor_id, successor_id,
+                          min_wait_minutes, max_wait_minutes, reason}]
     """
     by_id = {e["id"]: e for e in events}
 
@@ -56,29 +85,40 @@ def compute(events, relations):
         else:
             active[e["id"]] = e
 
-    # ---- 2. 过滤涉及暂存事件的关系 --------------------------------------
+    # ---- 2. 过滤涉及暂存事件的关系，并规范化间隔设置 --------------------
     skipped_relations = []
     active_relations = []
     for r in relations:
-        a, b = r["predecessor_id"], r["successor_id"]
-        inactive = [by_id[x]["name"] for x in (a, b) if x in by_id and x not in active]
+        minw, maxw = _norm_waits(r)
+        rr = {
+            "id": r["id"],
+            "predecessor_id": r["predecessor_id"],
+            "successor_id": r["successor_id"],
+            "min_wait_minutes": minw,
+            "max_wait_minutes": maxw,
+        }
+        a, b = rr["predecessor_id"], rr["successor_id"]
         if a not in by_id or b not in by_id:
             skipped_relations.append({
-                "id": r["id"], "predecessor_id": a, "successor_id": b,
+                **rr,
                 "reason": "关系引用了不存在的事件，已忽略",
             })
-        elif inactive:
+            continue
+        inactive = [by_id[x]["name"] for x in (a, b) if x not in active]
+        if inactive:
             skipped_relations.append({
-                "id": r["id"], "predecessor_id": a, "successor_id": b,
-                "reason": "关联事件「" + "、".join(inactive) + "」处于暂存状态，该“先于”关系暂不参与推算",
+                **rr,
+                "reason": "关联事件「" + "、".join(inactive)
+                          + "」处于暂存状态，该“先于”关系暂不参与推算",
             })
         else:
-            active_relations.append(r)
+            active_relations.append(rr)
 
     est = {i: _parse(e["earliest_start"]) for i, e in active.items()}
     lst = {i: _parse(e["latest_start"]) for i, e in active.items()}
     dur = {i: int(e["duration_minutes"]) for i, e in active.items()}
-    # 依据来源：est_src[b] = (a, relation_id) 表示 b 的最早开始由 a 推得
+    # 依据来源：src[x] = (other, relation_id, rule) 表示 x 的边界由 other 经
+    # rule（emin/emax/lmin/lmax 四种传播之一）推得。
     est_src = {i: None for i in active}
     lst_src = {i: None for i in active}
 
@@ -94,95 +134,156 @@ def compute(events, relations):
                     e["name"], _fmt(est[i]), _fmt(lst[i])),
             })
 
-    # ---- 3. 前向/后向松弛（Bellman-Ford 方式，检测循环） -----------------
-    n = len(active)
+    rel_by_id = {r["id"]: r for r in active_relations}
 
-    def relax_forward():
+    # ---- 3. 约束传播（Bellman-Ford 方式，同时施加间隔上下界） -----------
+    # 对关系 A 先于 B（A 持续 da，最短等待 lo，最长等待 hi），一次扫描施加：
+    #   最短间隔前向：est[B] ≥ est[A] + da + lo
+    #   最短间隔后向：lst[A] ≤ lst[B] − da − lo
+    #   最长间隔后向：lst[B] ≤ lst[A] + da + hi   （hi 存在时）
+    #   最长间隔前向：est[A] ≥ est[B] − da − hi   （hi 存在时）
+    def tighten():
         changed = False
         for r in active_relations:
             a, b = r["predecessor_id"], r["successor_id"]
-            cand = est[a] + timedelta(minutes=dur[a])
+            lo, hi = r["min_wait_minutes"], r["max_wait_minutes"]
+            da = timedelta(minutes=dur[a])
+
+            cand = est[a] + da + timedelta(minutes=lo)
             if cand > est[b]:
                 est[b] = cand
-                est_src[b] = (a, r["id"])
+                est_src[b] = (a, r["id"], "emin")
                 changed = True
-        return changed
 
-    def relax_backward():
-        changed = False
-        for r in active_relations:
-            a, b = r["predecessor_id"], r["successor_id"]
-            cand = lst[b] - timedelta(minutes=dur[a])
+            cand = lst[b] - da - timedelta(minutes=lo)
             if cand < lst[a]:
                 lst[a] = cand
-                lst_src[a] = (b, r["id"])
+                lst_src[a] = (b, r["id"], "lmin")
                 changed = True
+
+            if hi is not None:
+                cand = lst[a] + da + timedelta(minutes=hi)
+                if cand < lst[b]:
+                    lst[b] = cand
+                    lst_src[b] = (a, r["id"], "lmax")
+                    changed = True
+
+                cand = est[b] - da - timedelta(minutes=hi)
+                if cand > est[a]:
+                    est[a] = cand
+                    est_src[a] = (b, r["id"], "emax")
+                    changed = True
         return changed
 
-    forward_cycle = backward_cycle = False
+    n = len(active)
+    has_cycle = False
     if n:
         for _ in range(n):
-            if not relax_forward():
+            if not tighten():
                 break
         else:
-            forward_cycle = True
-        for _ in range(n):
-            if not relax_backward():
-                break
-        else:
-            backward_cycle = True
+            # 第 n 轮仍可收紧：差约束中存在正环，即“先于”关系成环且间隔/持续
+            # 要求沿环累加后不可满足。
+            has_cycle = True
 
-    def find_cycle(src):
+    # ---- 3b. 定位成环事件 ------------------------------------------------
+    def src_cycle_nodes(src):
+        """沿 src 依据指针找出仍在收紧的环上的节点集合。"""
         for start in active:
-            seen = {}
-            path = []
+            seen = set()
             cur = start
             while cur is not None and cur not in seen:
-                seen[cur] = len(path)
-                path.append(cur)
+                seen.add(cur)
                 s = src.get(cur)
                 cur = s[0] if s else None
             if cur is not None:
-                return path[seen[cur]:]
+                nodes = [cur]
+                s = src.get(cur)
+                nxt = s[0] if s else None
+                guard = 0
+                while nxt is not None and nxt != cur and guard <= n:
+                    nodes.append(nxt)
+                    s2 = src.get(nxt)
+                    nxt = s2[0] if s2 else None
+                    guard += 1
+                return nodes
         return []
 
-    if forward_cycle or backward_cycle:
-        cyc = find_cycle(est_src) or find_cycle(lst_src)
-        names = [active[i]["name"] for i in cyc]
-        conflicts.append({
-            "type": "cycle",
-            "event_ids": cyc,
-            "message": "“先于”关系构成循环：{}，约束不可满足".format(
-                " → ".join(names + names[:1]) if names else "未知"),
-        })
+    def order_along_relations(node_set):
+        """在环节点诱导子图中按“先于”方向 DFS，返回有序节点与逐条关系 id。"""
+        node_set = set(node_set)
+        out = {i: [] for i in node_set}
+        for r in active_relations:
+            a, b = r["predecessor_id"], r["successor_id"]
+            if a in node_set and b in node_set:
+                out[a].append((b, r["id"]))
+
+        def dfs(u, stack, edges, on):
+            on.add(u)
+            stack.append(u)
+            for v, rid in out.get(u, []):
+                if v in on:
+                    idx = stack.index(v)
+                    return stack[idx:], edges[idx:] + [rid]
+                res = dfs(v, stack, edges + [rid], on)
+                if res:
+                    return res
+            on.discard(u)
+            stack.pop()
+            return None
+
+        for s in node_set:
+            res = dfs(s, [], [], set())
+            if res:
+                return res
+        return [], []
+
+    cyc_nodes = []
+    cyc_edges = []
+    if has_cycle:
+        node_set = src_cycle_nodes(est_src) or src_cycle_nodes(lst_src)
+        cyc_nodes, cyc_edges = order_along_relations(node_set)
 
     # ---- 4. 依据链构建 ---------------------------------------------------
-    def build_chain(start_id, kind):
+    def step_text(cur, src, kind):
+        other, rid, rule = src
+        r = rel_by_id[rid]
+        a, b = r["predecessor_id"], r["successor_id"]
+        an, bn = active[a]["name"], active[b]["name"]
+        da = dur[a]
+        paren = _wait_paren(r["min_wait_minutes"], r["max_wait_minutes"])
+        if rule == "emin":
+            return "「{}」先于「{}」{}，且「{}」持续 {} 分钟 ⇒ 「{}」最早开始不早于 {}".format(
+                an, bn, paren, an, da, bn, _fmt(est[b]))
+        if rule == "emax":
+            return ("「{}」先于「{}」{}，「{}」最早开始不早于 {}，且「{}」持续 {} 分钟"
+                    " ⇒ 「{}」最早开始不早于 {}").format(
+                an, bn, paren, bn, _fmt(est[b]), an, da, an, _fmt(est[a]))
+        if rule == "lmin":
+            return "「{}」先于「{}」{}，且「{}」持续 {} 分钟 ⇒ 「{}」最晚开始不晚于 {}".format(
+                an, bn, paren, an, da, an, _fmt(lst[a]))
+        return "「{}」先于「{}」{}，「{}」最晚开始不晚于 {}，且「{}」持续 {} 分钟 ⇒ 「{}」最晚开始不晚于 {}".format(
+            an, bn, paren, an, _fmt(lst[a]), an, da, bn, _fmt(lst[b]))
+
+    def build_chain(start_id, kind, src_map):
         """从结论回溯到输入依据，返回按“输入 → 结论”排列的步骤列表。"""
         steps = []
         cur = start_id
         seen = set()
         while True:
             ev = active[cur]
-            src = est_src[cur] if kind == "est" else lst_src[cur]
+            src = src_map[cur]
             val = est[cur] if kind == "est" else lst[cur]
             if src is None:
                 label = "最早开始" if kind == "est" else "最晚开始"
                 steps.append({"text": "「{}」输入的{}为 {}".format(ev["name"], label, _fmt(val))})
                 break
-            other, _rid = src
-            oev = active[other]
-            if kind == "est":
-                steps.append({"text": "「{}」先于「{}」且「{}」持续 {} 分钟 ⇒ 「{}」最早开始不早于 {}".format(
-                    oev["name"], ev["name"], oev["name"], dur[other], ev["name"], _fmt(val))})
-            else:
-                steps.append({"text": "「{}」先于「{}」且「{}」持续 {} 分钟 ⇒ 「{}」最晚开始不晚于 {}".format(
-                    ev["name"], oev["name"], ev["name"], dur[cur], ev["name"], _fmt(val))})
+            steps.append({"text": step_text(cur, src, kind)})
             if cur in seen:
                 steps.append({"text": "（检测到循环依赖，回溯终止）"})
                 break
             seen.add(cur)
-            cur = other
+            cur = src[0]
         steps.reverse()
         return steps
 
@@ -194,12 +295,64 @@ def compute(events, relations):
             "latest_start": _fmt(lst[i]),
             "earliest_end": _fmt(est[i] + timedelta(minutes=dur[i])),
             "latest_end": _fmt(lst[i] + timedelta(minutes=dur[i])),
-            "earliest_chain": build_chain(i, "est"),
-            "latest_chain": build_chain(i, "lst"),
+            "earliest_chain": build_chain(i, "est", est_src),
+            "latest_chain": build_chain(i, "lst", lst_src),
         }
 
-    # ---- 6. 窗口冲突（最早可行开始晚于最晚可行开始） ----------------------
-    if not (forward_cycle or backward_cycle):
+    # ---- 6. 成环冲突：冲突事件 + 前向/后向（相反）依据链 -----------------
+    if has_cycle:
+        names = [active[i]["name"] for i in cyc_nodes]
+        forward_chain = []
+        reverse_chain = []
+        if cyc_nodes:
+            k = len(cyc_nodes)
+
+            def edge_parts(rid, a, b):
+                r = rel_by_id[rid]
+                an, bn = active[a]["name"], active[b]["name"]
+                paren = _wait_paren(r["min_wait_minutes"], r["max_wait_minutes"])
+                da = dur[a]
+                return r, an, bn, paren, da
+
+            # 前向：沿“先于”方向陈述每条关系对开始时刻之差的下界（持续+最短等待）
+            for idx, rid in enumerate(cyc_edges):
+                a, b = cyc_nodes[idx], cyc_nodes[(idx + 1) % k]
+                r, an, bn, paren, da = edge_parts(rid, a, b)
+                lo_total = da + r["min_wait_minutes"]
+                wait_part = "、最短等待 {} 分钟".format(r["min_wait_minutes"]) \
+                    if r["min_wait_minutes"] else ""
+                forward_chain.append({"text":
+                    "「{}」先于「{}」{}：{}开始 − {}开始 ≥ {} 分钟（持续 {} 分钟{}）".format(
+                        an, bn, paren, bn, an, lo_total, da, wait_part)})
+
+            # 相反方向：后向回推。下界翻转为“最晚开始 − 常量”；存在最长等待时
+            # 还给出开始时刻之差的上界（持续+最长等待），与前向各下界沿环相加矛盾。
+            for idx in range(k - 1, -1, -1):
+                rid = cyc_edges[idx]
+                a, b = cyc_nodes[idx], cyc_nodes[(idx + 1) % k]
+                r, an, bn, paren, da = edge_parts(rid, a, b)
+                if r["max_wait_minutes"] is not None:
+                    hi_total = da + r["max_wait_minutes"]
+                    reverse_chain.append({"text":
+                        "沿后向回推关系「{}」先于「{}」{}：{}开始 − {}开始 ≤ {} 分钟"
+                        "（持续 {} 分钟、最长等待 {} 分钟）".format(
+                            an, bn, paren, bn, an, hi_total, da, r["max_wait_minutes"])})
+                else:
+                    lo_total = da + r["min_wait_minutes"]
+                    reverse_chain.append({"text":
+                        "沿后向回推关系「{}」先于「{}」{}：「{}」最晚开始 ≤ 「{}」最晚开始 − {} 分钟".format(
+                            an, bn, paren, an, bn, lo_total)})
+        conflicts.append({
+            "type": "cycle",
+            "event_ids": cyc_nodes,
+            "message": "“先于”关系构成循环：{}，间隔与持续要求沿环累加后约束不可满足".format(
+                " → ".join(names + names[:1]) if names else "（未能定位具体环节）"),
+            "forward_chain": forward_chain,
+            "reverse_chain": reverse_chain,
+        })
+
+    # ---- 7. 窗口冲突（最早可行开始晚于最晚可行开始） ---------------------
+    if not has_cycle:
         for i in active:
             if i in invalid_range:
                 continue  # 已在输入层面报告

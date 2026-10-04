@@ -79,6 +79,10 @@ function resetEdits() {
   state.editRelations = b.relations.map((r) => ({
     predecessor_key: idToKey[r.predecessor_id],
     successor_key: idToKey[r.successor_id],
+    min_wait_minutes: r.min_wait_minutes === null || r.min_wait_minutes === undefined
+      ? 0 : r.min_wait_minutes,
+    max_wait_minutes: r.max_wait_minutes === null || r.max_wait_minutes === undefined
+      ? "" : r.max_wait_minutes,
   })).filter((r) => r.predecessor_key && r.successor_key);
 }
 
@@ -146,6 +150,18 @@ function renderEventsTable() {
   }
 }
 
+function waitLabel(r) {
+  const minw = Number(r.min_wait_minutes) || 0;
+  const maxRaw = r.max_wait_minutes === "" || r.max_wait_minutes === null
+    || r.max_wait_minutes === undefined ? null : Number(r.max_wait_minutes);
+  if (maxRaw === null) {
+    return minw === 0 ? "结束不晚于后项开始（旧语义）" : `至少等待 ${minw} 分钟`;
+  }
+  if (maxRaw === minw) return `须恰好等待 ${minw} 分钟`;
+  if (minw === 0) return `至多等待 ${maxRaw} 分钟`;
+  return `等待 ${minw}～${maxRaw} 分钟`;
+}
+
 function renderRelations() {
   const opts = state.editEvents
     .map((e) => `<option value="${e.key}">${escapeHtml(e.name)}</option>`).join("");
@@ -155,13 +171,32 @@ function renderRelations() {
   ul.innerHTML = "";
   state.editRelations.forEach((r, idx) => {
     const li = document.createElement("li");
-    li.innerHTML = `<span>「${escapeHtml(eventName(r.predecessor_key))}」先于「${escapeHtml(eventName(r.successor_key))}」</span>`;
+    const left = document.createElement("span");
+    left.innerHTML = `「${escapeHtml(eventName(r.predecessor_key))}」先于「${escapeHtml(eventName(r.successor_key))}」`
+      + ` <span class="wait-tag">${escapeHtml(waitLabel(r))}</span>`;
+    const inputs = document.createElement("span");
+    inputs.className = "rel-waits";
+    inputs.innerHTML =
+      `<label>最短等待 <input type="number" min="0" step="1" class="rel-min" style="width:70px"> 分</label>` +
+      `<label>最长等待 <input type="number" min="0" step="1" class="rel-max" style="width:70px"> 分（空=不限）</label>`;
+    inputs.querySelector(".rel-min").value = r.min_wait_minutes;
+    inputs.querySelector(".rel-max").value = r.max_wait_minutes;
+    inputs.querySelector(".rel-min").addEventListener("input", (e) => {
+      r.min_wait_minutes = e.target.value === "" ? 0 : parseInt(e.target.value, 10);
+      left.querySelector(".wait-tag").textContent = waitLabel(r);
+    });
+    inputs.querySelector(".rel-max").addEventListener("input", (e) => {
+      r.max_wait_minutes = e.target.value;
+      left.querySelector(".wait-tag").textContent = waitLabel(r);
+    });
     const btn = document.createElement("button");
     btn.textContent = "✕";
     btn.addEventListener("click", () => {
       state.editRelations.splice(idx, 1);
       renderRelations();
     });
+    li.appendChild(left);
+    li.appendChild(inputs);
     li.appendChild(btn);
     ul.appendChild(li);
   });
@@ -190,7 +225,12 @@ function buildResultHtml(res, evByKey) {
   if (nConf > 0) {
     conflicts = `<div class="section-title">冲突明细（输入已保留）</div>` + res.conflicts.map((c) => {
       let html = `<div class="card conflict"><div class="msg">⚠ ${escapeHtml(c.message)}</div>`;
-      if (c.earliest_chain) {
+      if (c.type === "cycle") {
+        if (c.forward_chain && c.forward_chain.length) {
+          html += `<details open><summary>前向依据链（沿“先于”方向逐步累加间隔）</summary>${chainHtml(c.forward_chain)}</details>`;
+          html += `<details open><summary>相反依据链（后向回推，与前向约束矛盾）</summary>${chainHtml(c.reverse_chain)}</details>`;
+        }
+      } else if (c.earliest_chain) {
         html += `<details open><summary>最早可行开始的依据链</summary>${chainHtml(c.earliest_chain)}</details>`;
         html += `<details open><summary>最晚可行开始的依据链</summary>${chainHtml(c.latest_chain)}</details>`;
       }
@@ -273,6 +313,27 @@ function syncFromDOM() {
 async function save() {
   if (!state.current) return;
   syncFromDOM();
+  for (const r of state.editRelations) {
+    const minw = Number(r.min_wait_minutes);
+    if (!Number.isInteger(minw) || minw < 0) {
+      showBanner(`⚠ 「${eventName(r.predecessor_key)}」先于「${eventName(r.successor_key)}」`
+        + " 的最短等待必须是非负整数分钟");
+      return;
+    }
+    if (r.max_wait_minutes !== "") {
+      const maxw = Number(r.max_wait_minutes);
+      if (!Number.isInteger(maxw) || maxw < 0) {
+        showBanner(`⚠ 「${eventName(r.predecessor_key)}」先于「${eventName(r.successor_key)}」`
+          + " 的最长等待必须是非负整数分钟（或留空表示不限）");
+        return;
+      }
+      if (maxw < minw) {
+        showBanner(`⚠ 「${eventName(r.predecessor_key)}」先于「${eventName(r.successor_key)}」`
+          + ` 的最长等待（${maxw}）不得短于最短等待（${minw}）`);
+        return;
+      }
+    }
+  }
   const payload = {
     base_version: state.current.review.version,
     title: $("#review-title").value.trim(),
@@ -284,7 +345,13 @@ async function save() {
       duration_minutes: e.duration_minutes === "" ? null : e.duration_minutes,
       note: e.note,
     })),
-    relations: state.editRelations,
+    relations: state.editRelations.map((r) => ({
+      predecessor_key: r.predecessor_key,
+      successor_key: r.successor_key,
+      min_wait_minutes: Number(r.min_wait_minutes) || 0,
+      max_wait_minutes: r.max_wait_minutes === "" || r.max_wait_minutes === null
+        || r.max_wait_minutes === undefined ? null : Number(r.max_wait_minutes),
+    })),
   };
   try {
     const bundle = await api("PUT", "/api/reviews/" + state.current.review.id, payload);
@@ -421,7 +488,8 @@ function renderVersionDetail(detail) {
     const a = byKey[r.predecessor_key], b = byKey[r.successor_key];
     const an = a ? a.name : "?";
     const bn = b ? b.name : "?";
-    return `<div>「${escapeHtml(an)}」先于「${escapeHtml(bn)}」</div>`;
+    return `<div>「${escapeHtml(an)}」先于「${escapeHtml(bn)}」`
+      + ` <span class="wait-tag">${escapeHtml(waitLabel(r))}</span></div>`;
   }).join("") || `<div class="hint">无</div>`;
 
   // 快照事件以 id_<旧行id> 为 key，推算结果窗口仍以旧行 id 为键
@@ -509,7 +577,10 @@ $("#btn-add-event").addEventListener("click", () => {
 $("#btn-add-relation").addEventListener("click", () => {
   const a = $("#rel-pre").value, b = $("#rel-suc").value;
   if (!a || !b) return;
-  state.editRelations.push({ predecessor_key: a, successor_key: b });
+  state.editRelations.push({
+    predecessor_key: a, successor_key: b,
+    min_wait_minutes: 0, max_wait_minutes: "",
+  });
   renderRelations();
 });
 

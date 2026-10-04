@@ -90,9 +90,16 @@ td .row-del { padding: 2px 8px; }
 ul.relations { list-style: none; margin: 0; padding: 0; }
 ul.relations li {
   display: flex; justify-content: space-between; align-items: center;
+  gap: 10px; flex-wrap: wrap;
   padding: 6px 8px; border: 1px solid var(--border); border-radius: 6px; margin-bottom: 6px;
   background: var(--panel2);
 }
+.wait-tag {
+  font-size: 11px; color: var(--accent); border: 1px solid var(--border);
+  border-radius: 9px; padding: 1px 7px; margin-left: 4px; white-space: nowrap;
+}
+.rel-waits { display: flex; gap: 10px; align-items: center; color: var(--muted); font-size: 12px; }
+.rel-waits label { white-space: nowrap; }
 
 .summary { padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-weight: 600; }
 .summary.ok { background: rgba(47,191,113,.12); border: 1px solid var(--ok); color: var(--ok); }

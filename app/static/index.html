@@ -42,7 +42,7 @@
     <button id="btn-add-event">+ 添加事件</button>
 
     <h2>“先于”关系</h2>
-    <p class="hint">A 先于 B：A 必须在 B 开始前结束（A 开始 + A 持续 ≤ B 开始）。</p>
+    <p class="hint">A 先于 B：A 必须在 B 开始前结束。可设置「前项结束 → 后项开始」的允许间隔：最短等待为非负整数分钟（默认 0），最长等待可留空表示不限；最长等待不得短于最短等待。未设置间隔的旧关系仍按“A 结束不晚于 B 开始”推算。</p>
     <div class="relation-add">
       <select id="rel-pre"></select>
       <span>先于</span>
